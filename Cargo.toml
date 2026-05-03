@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/protocol",
+    "crates/appd",
+    "crates/apptoggle",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["aCeTotal"]
+
+[workspace.dependencies]
+log = "0.4"
+env_logger = "0.11"
+protocol = { path = "crates/protocol" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev]
+opt-level = 1
