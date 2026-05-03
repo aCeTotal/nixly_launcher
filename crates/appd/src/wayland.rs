@@ -1,5 +1,7 @@
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
+use std::sync::{mpsc, Arc};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use khronos_egl as egl;
@@ -116,6 +118,43 @@ struct RepeatState {
 pub enum Action {
     Exec(Vec<String>),
     Open(PathBuf),
+}
+
+// File-search runs on a worker thread so typing stays smooth even when the
+// indexed file set is large. The main thread updates `query` and redraws
+// immediately on each keystroke, then dispatches a search request; the
+// worker computes hits and sends them back via a calloop channel.
+struct SearchRequest {
+    gen: u64,
+    query: String,
+    labels: Arc<Vec<String>>,
+}
+
+struct SearchResult {
+    gen: u64,
+    hits: Vec<matcher::Hit>,
+}
+
+fn spawn_search_worker(
+    rx: mpsc::Receiver<SearchRequest>,
+    tx: calloop::channel::Sender<SearchResult>,
+) {
+    thread::Builder::new()
+        .name("filesearch".into())
+        .spawn(move || {
+            let mut matcher = matcher::Index::new();
+            while let Ok(mut req) = rx.recv() {
+                // Drain any newer pending requests — only the latest matters.
+                while let Ok(newer) = rx.try_recv() {
+                    req = newer;
+                }
+                let hits = matcher.search(&req.labels[..], |s| s.as_str(), &req.query);
+                if tx.send(SearchResult { gen: req.gen, hits }).is_err() {
+                    return;
+                }
+            }
+        })
+        .ok();
 }
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -245,6 +284,20 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         })
         .map_err(|e| format!("insert gitscan source: {e}"))?;
 
+    // Background search worker: keeps file-search typing smooth even on huge
+    // indices. Main thread sends (gen, query, labels) and redraws immediately;
+    // worker returns hits via the calloop channel below.
+    let (search_req_tx, search_req_rx) = mpsc::channel::<SearchRequest>();
+    let (search_res_tx, search_res_rx) = calloop::channel::channel::<SearchResult>();
+    spawn_search_worker(search_req_rx, search_res_tx);
+    loop_handle
+        .insert_source(search_res_rx, |ev, _, app: &mut App| {
+            if let calloop::channel::Event::Msg(result) = ev {
+                app.on_search_result(result);
+            }
+        })
+        .map_err(|e| format!("insert search source: {e}"))?;
+
     // Initial walks — populate as soon as daemon starts.
     fileindex::spawn(file_idx_tx.clone());
     gitscan::spawn(git_tx.clone());
@@ -267,6 +320,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let font_data = font::load_default()
         .map_err(|e| format!("font: {e}"))?;
 
+    let files_labels = labels_for(&files_list);
     let mut app = App {
         qh: qh.clone(),
         registry: RegistryState::new(&globals),
@@ -300,9 +354,12 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         mode: Mode::Launcher,
         launcher_list,
         files_list,
+        files_labels,
         git_list,
         persisted,
         icon_resolver,
+        search_tx: search_req_tx,
+        search_gen: 0,
     };
     app.refresh_matches();
 
@@ -347,9 +404,12 @@ pub struct App {
     mode: Mode,
     launcher_list: Vec<ListEntry>,
     files_list: Vec<ListEntry>,
+    files_labels: Arc<Vec<String>>,
     git_list: Vec<ListEntry>,
     persisted: state::State,
     icon_resolver: icon::Resolver,
+    search_tx: mpsc::Sender<SearchRequest>,
+    search_gen: u64,
 }
 
 struct UiSession {
@@ -563,6 +623,10 @@ fn file_label(p: &Path) -> String {
         .unwrap_or_else(|| p.to_string_lossy().into_owned())
 }
 
+fn labels_for(list: &[ListEntry]) -> Arc<Vec<String>> {
+    Arc::new(list.iter().map(|e| e.label.clone()).collect())
+}
+
 fn git_list_from_projects(projects: Vec<gitscan::GitProject>) -> Vec<ListEntry> {
     projects
         .into_iter()
@@ -579,6 +643,7 @@ impl App {
     fn update_files_from_index(&mut self, recents: Vec<recents::Recent>) {
         let count = recents.len();
         self.files_list = files_list_from_recents(recents);
+        self.files_labels = labels_for(&self.files_list);
         log::info!("files index: {count} entries");
         if self.mode == Mode::Files {
             self.refresh_matches();
@@ -613,6 +678,23 @@ impl App {
     }
 
     fn refresh_matches(&mut self) {
+        // Bump on every call so any in-flight async result for an older
+        // query/list is dropped when it lands.
+        self.search_gen = self.search_gen.wrapping_add(1);
+
+        // Files mode with a non-empty query → run the search on the worker
+        // thread. We leave self.matches as-is (stale) so the user keeps seeing
+        // the previous results until the new ones land — typing stays smooth.
+        if self.mode == Mode::Files && !self.query.is_empty() {
+            let req = SearchRequest {
+                gen: self.search_gen,
+                query: self.query.clone(),
+                labels: Arc::clone(&self.files_labels),
+            };
+            let _ = self.search_tx.send(req);
+            return;
+        }
+
         let list: &[ListEntry] = match self.mode {
             Mode::Launcher => &self.launcher_list,
             Mode::Files => &self.files_list,
@@ -630,6 +712,24 @@ impl App {
         }
         self.scroll_offset = 0;
         self.ensure_visible();
+    }
+
+    fn on_search_result(&mut self, result: SearchResult) {
+        if result.gen != self.search_gen {
+            return;
+        }
+        if self.mode != Mode::Files || self.query.is_empty() {
+            return;
+        }
+        self.matches = result.hits;
+        if self.selected >= self.matches.len() {
+            self.selected = self.matches.len().saturating_sub(1);
+        }
+        self.scroll_offset = 0;
+        self.ensure_visible();
+        if self.session.is_some() {
+            self.draw();
+        }
     }
 
     fn ensure_visible(&mut self) {
@@ -707,10 +807,8 @@ impl App {
 
     fn handle_key(&mut self, event: KeyEvent) {
         let ctrl = self.modifiers.ctrl;
-        // Plain hjkl take over when there's no query to type into; once a
-        // search is active, those letters go into the query and Ctrl+hjkl is
-        // the way to navigate.
-        let nav = ctrl || self.query.is_empty();
+        let logo = self.modifiers.logo;
+        let shift = self.modifiers.shift;
 
         match event.keysym {
             Keysym::Escape => {
@@ -728,16 +826,13 @@ impl App {
             Keysym::ISO_Left_Tab => self.cycle_mode(false),
             Keysym::Right => self.cycle_mode(true),
             Keysym::Left => self.cycle_mode(false),
+            Keysym::p if logo => self.cycle_mode(!shift),
             Keysym::p if ctrl => self.cycle_mode(true),
             Keysym::n if ctrl => self.cycle_mode(false),
-            Keysym::k if nav => self.cycle_mode(false),
-            Keysym::l if nav => self.cycle_mode(true),
 
             // ── List nav ────────────────────────────────────────────────────
             Keysym::Up => self.select_prev(),
             Keysym::Down => self.select_next(),
-            Keysym::h if nav => self.select_prev(),
-            Keysym::j if nav => self.select_next(),
 
             Keysym::BackSpace => {
                 self.query.pop();
