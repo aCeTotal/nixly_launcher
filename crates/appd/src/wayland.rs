@@ -702,7 +702,7 @@ impl App {
         };
         self.matches = self.matcher.search(list, |e| e.label.as_str(), &self.query);
         // File search: with no query, limit to the 20 most recently edited.
-        // With a query, all fuzzy matches are kept so Enter (→ thunar staging)
+        // With a query, all fuzzy matches are kept so Enter (→ dolphin staging)
         // collects every result.
         if self.mode == Mode::Files && self.query.is_empty() {
             self.matches.truncate(FILES_DEFAULT_LIMIT);
@@ -875,7 +875,7 @@ impl App {
         match self.mode {
             Mode::Launcher => self.run_launcher_action(),
             Mode::Git => self.run_git_action(),
-            Mode::Files => self.show_files_in_thunar(),
+            Mode::Files => self.show_files_in_dolphin(),
         }
     }
 
@@ -921,10 +921,10 @@ impl App {
 
     // Materialises every visible file-search match as a symlink into a stable
     // per-session staging dir under XDG_RUNTIME_DIR, then opens that dir in
-    // Thunar so the user can browse / drag / select multiple results at once.
+    // Dolphin so the user can browse / drag / select multiple results at once.
     // Each Enter clears the dir and repopulates so it always reflects the
     // current query.
-    fn show_files_in_thunar(&self) {
+    fn show_files_in_dolphin(&self) {
         let stage = staging_dir();
         // Always start clean — never carry over old symlinks from a previous
         // search. remove_dir_all + create_dir_all guarantees a fresh dir.
@@ -934,7 +934,7 @@ impl App {
             return;
         }
 
-        // Symlink names get a zero-padded "NN - " prefix so Thunar's default
+        // Symlink names get a zero-padded "NN - " prefix so Dolphin's default
         // alphabetical sort matches the order the user saw in the launcher
         // list (best match first when searching, mtime-desc otherwise).
         let total = self.matches.len();
@@ -959,8 +959,10 @@ impl App {
         log::info!("files: {linked} symlinks in {}", stage.display());
 
         let stage_str = stage.to_string_lossy().into_owned();
-        if !try_spawn("thunar", &[stage_str.clone()]) {
-            log::warn!("thunar unavailable — falling back to xdg-open");
+        // Dolphin reuses its existing process via session DBus, so a 2nd Enter
+        // re-opens the staging dir near-instantly (no KDE-frameworks cold start).
+        if !try_spawn("dolphin", &[stage_str.clone()]) {
+            log::warn!("dolphin unavailable — falling back to xdg-open");
             spawn_detached("xdg-open", &[stage_str]);
         }
     }
@@ -976,13 +978,7 @@ impl App {
     fn dispatch(&mut self, cmd: Command) {
         log::info!("recv {cmd:?}");
         match cmd {
-            Command::Toggle => {
-                if self.session.is_some() {
-                    self.hide();
-                } else {
-                    self.show();
-                }
-            }
+            Command::Toggle => self.show(),
             Command::Show => self.show(),
             Command::Hide => self.hide(),
             Command::Quit => self.exit = true,
