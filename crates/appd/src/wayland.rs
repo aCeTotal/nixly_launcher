@@ -126,19 +126,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let compositor_state = CompositorState::bind(&globals, &qh)?;
     let layer_shell = LayerShell::bind(&globals, &qh)?;
 
-    let surface = compositor_state.create_surface(&qh);
-    let layer = layer_shell.create_layer_surface(
-        &qh,
-        surface,
-        Layer::Overlay,
-        Some("nixly_launcher"),
-        None,
-    );
-    layer.set_anchor(Anchor::empty()); // empty == centered
-    layer.set_size(FALLBACK_WIDTH, FALLBACK_HEIGHT);
-    layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
-    layer.commit();
-
+    // EGL display + config + context survive across show/hide cycles.
+    // No window-bound surface is created until the first show().
     let egl = unsafe { Egl::load_required()? };
     let display_ptr = conn.backend().display_ptr() as *mut c_void;
     let egl_display = unsafe { egl.get_display(display_ptr) }
@@ -279,6 +268,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("font: {e}"))?;
 
     let mut app = App {
+        qh: qh.clone(),
         registry: RegistryState::new(&globals),
         output: OutputState::new(&globals, &qh),
         seat: SeatState::new(&globals, &qh),
@@ -287,25 +277,19 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         repeat: None,
         repeat_delay: DEFAULT_REPEAT_DELAY,
         repeat_rate: DEFAULT_REPEAT_RATE,
-        _compositor: compositor_state,
-        layer,
-        configured: false,
-        visible: true,
-        width: FALLBACK_WIDTH,
-        height: FALLBACK_HEIGHT,
-        size_locked: false,
-        egl: EglState {
+        compositor: compositor_state,
+        layer_shell,
+        egl_static: EglStatic {
             instance: egl,
             display: egl_display,
             config,
             context,
-            surface: None,
-            window: None,
         },
         gl: None,
         renderer: None,
         font_data,
         exit: false,
+        session: None,
         entries,
         last_current_system: read_current_system(),
         query: String::new(),
@@ -322,6 +306,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
     app.refresh_matches();
 
+    log::info!("daemon ready — waiting for show command on socket");
+
     while !app.exit {
         event_loop.dispatch(None, &mut app)?;
     }
@@ -329,6 +315,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 pub struct App {
+    qh: QueueHandle<App>,
     registry: RegistryState,
     output: OutputState,
     seat: SeatState,
@@ -337,18 +324,19 @@ pub struct App {
     repeat: Option<RepeatState>,
     repeat_delay: Duration,
     repeat_rate: Duration,
-    _compositor: CompositorState,
-    layer: LayerSurface,
-    configured: bool,
-    visible: bool,
-    width: u32,
-    height: u32,
-    size_locked: bool,
-    egl: EglState,
+    compositor: CompositorState,
+    layer_shell: LayerShell,
+    egl_static: EglStatic,
+    // gl + renderer are tied to the EGL context, not to a particular surface.
+    // They're created lazily on the first show() and reused across every
+    // subsequent show/hide cycle, so the icon atlas / glyph cache survive.
     gl: Option<glow::Context>,
     renderer: Option<render::Renderer>,
     font_data: Vec<u8>,
     exit: bool,
+    // Some(...) iff the launcher window is currently mapped. Show creates it,
+    // hide tears it down — the daemon itself stays running.
+    session: Option<UiSession>,
     entries: Vec<desktop::Entry>,
     last_current_system: Option<PathBuf>,
     query: String,
@@ -364,13 +352,21 @@ pub struct App {
     icon_resolver: icon::Resolver,
 }
 
-struct EglState {
+struct UiSession {
+    layer: LayerSurface,
+    egl_window: Option<WlEglSurface>,
+    egl_surface: Option<egl::Surface>,
+    width: u32,
+    height: u32,
+    configured: bool,
+    size_locked: bool,
+}
+
+struct EglStatic {
     instance: Egl,
     display: egl::Display,
     config: egl::Config,
     context: egl::Context,
-    surface: Option<egl::Surface>,
-    window: Option<WlEglSurface>,
 }
 
 fn read_current_system() -> Option<PathBuf> {
@@ -586,7 +582,9 @@ impl App {
         log::info!("files index: {count} entries");
         if self.mode == Mode::Files {
             self.refresh_matches();
-            self.draw();
+            if self.session.is_some() {
+                self.draw();
+            }
         }
     }
 
@@ -596,7 +594,9 @@ impl App {
         log::info!("git index: {count} entries");
         if self.mode == Mode::Git {
             self.refresh_matches();
-            self.draw();
+            if self.session.is_some() {
+                self.draw();
+            }
         }
     }
 
@@ -633,7 +633,12 @@ impl App {
     }
 
     fn ensure_visible(&mut self) {
-        let rows = visible_rows_for(self.height);
+        let height = self
+            .session
+            .as_ref()
+            .map(|s| s.height)
+            .unwrap_or(FALLBACK_HEIGHT);
+        let rows = visible_rows_for(height);
         if self.matches.is_empty() {
             self.scroll_offset = 0;
             return;
@@ -709,19 +714,11 @@ impl App {
 
         match event.keysym {
             Keysym::Escape => {
-                self.query.clear();
-                self.selected = 0;
-                self.refresh_matches();
-                self.visible = false;
                 self.hide();
                 return;
             }
             Keysym::Return | Keysym::KP_Enter => {
                 self.execute_selected();
-                self.query.clear();
-                self.selected = 0;
-                self.refresh_matches();
-                self.visible = false;
                 self.hide();
                 return;
             }
@@ -774,7 +771,9 @@ impl App {
             }
         }
         self.refresh_matches();
-        self.draw();
+        if self.session.is_some() {
+            self.draw();
+        }
     }
 
     fn execute_selected(&mut self) {
@@ -883,88 +882,168 @@ impl App {
         log::info!("recv {cmd:?}");
         match cmd {
             Command::Toggle => {
-                self.visible = !self.visible;
-                if self.visible {
-                    self.show();
-                } else {
+                if self.session.is_some() {
                     self.hide();
+                } else {
+                    self.show();
                 }
             }
-            Command::Show => {
-                self.visible = true;
-                self.show();
-            }
-            Command::Hide => {
-                self.visible = false;
-                self.hide();
-            }
+            Command::Show => self.show(),
+            Command::Hide => self.hide(),
             Command::Quit => self.exit = true,
         }
     }
 
+    // Build a fresh layer surface each time the launcher is shown. The
+    // surface is destroyed on hide() — this avoids the wlr-layer-shell
+    // re-map quirks (Hyprland in particular can leave an unmapped surface in
+    // an awkward state). The EGL display / context survive across cycles so
+    // the GL renderer + atlases are reused.
     fn show(&mut self) {
-        self.draw();
+        if self.session.is_some() {
+            // Already showing — just redraw so the newest match list lands.
+            self.draw();
+            return;
+        }
+
+        let surface = self.compositor.create_surface(&self.qh);
+        let layer = self.layer_shell.create_layer_surface(
+            &self.qh,
+            surface,
+            Layer::Overlay,
+            Some("nixly_launcher"),
+            None,
+        );
+
+        // Pick size from the first available output before commit so the
+        // launcher is sized correctly on its very first frame, before
+        // configure arrives. Outputs the OutputState already saw at startup
+        // are visible here; any new output that appears later is handled in
+        // OutputHandler::new_output via size_locked.
+        let (mut width, mut height, mut size_locked) =
+            (FALLBACK_WIDTH, FALLBACK_HEIGHT, false);
+        for output in self.output.outputs() {
+            let Some(info) = self.output.info(&output) else { continue };
+            let Some((lw, lh)) = info.logical_size else { continue };
+            width = (((lw * 5) / 8).max(720)) as u32;
+            height = (((lh * 5) / 8).max(520)) as u32;
+            size_locked = true;
+            break;
+        }
+
+        layer.set_anchor(Anchor::empty()); // empty == centered
+        layer.set_size(width, height);
+        layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
+        layer.commit();
+
+        self.session = Some(UiSession {
+            layer,
+            egl_window: None,
+            egl_surface: None,
+            width,
+            height,
+            configured: false,
+            size_locked,
+        });
+        log::info!("show: layer surface created {width}x{height}");
     }
 
     fn hide(&mut self) {
-        self.layer.wl_surface().attach(None, 0, 0);
-        self.layer.commit();
+        self.repeat = None;
+        // Reset transient UI state so the next show starts at a clean prompt.
+        self.query.clear();
+        self.selected = 0;
+        self.scroll_offset = 0;
+        self.refresh_matches();
+        self.destroy_session();
+    }
+
+    fn destroy_session(&mut self) {
+        let Some(mut sess) = self.session.take() else { return };
+        // Order: detach context → destroy egl::Surface (raw handle) → drop
+        // WlEglSurface (RAII, frees wl_egl_window) → LayerSurface drops
+        // (sends layer_surface.destroy + wl_surface.destroy to compositor).
+        let _ = self.egl_static.instance.make_current(
+            self.egl_static.display,
+            None,
+            None,
+            None,
+        );
+        if let Some(egl_surface) = sess.egl_surface.take() {
+            let _ = self
+                .egl_static
+                .instance
+                .destroy_surface(self.egl_static.display, egl_surface);
+        }
+        drop(sess.egl_window.take());
+        // sess (containing layer) drops here.
+        log::info!("hide: layer surface destroyed");
     }
 
     fn ensure_egl_window(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        if self.egl.window.is_some() {
+        let Some(sess) = self.session.as_mut() else { return Ok(()); };
+        if sess.egl_window.is_some() {
             return Ok(());
         }
-        let surface_id = self.layer.wl_surface().id();
-        let window = WlEglSurface::new(surface_id, self.width as i32, self.height as i32)?;
+        let surface_id = sess.layer.wl_surface().id();
+        let window = WlEglSurface::new(surface_id, sess.width as i32, sess.height as i32)?;
         let egl_surface = unsafe {
-            self.egl.instance.create_window_surface(
-                self.egl.display,
-                self.egl.config,
+            self.egl_static.instance.create_window_surface(
+                self.egl_static.display,
+                self.egl_static.config,
                 window.ptr() as _,
                 None,
             )
         }?;
-        self.egl.instance.make_current(
-            self.egl.display,
+        self.egl_static.instance.make_current(
+            self.egl_static.display,
             Some(egl_surface),
             Some(egl_surface),
-            Some(self.egl.context),
+            Some(self.egl_static.context),
         )?;
-        let instance_ptr: *const Egl = &self.egl.instance;
-        let gl = unsafe {
-            glow::Context::from_loader_function(|s| {
-                let inst = &*instance_ptr;
-                match inst.get_proc_address(s) {
-                    Some(f) => f as *const _,
-                    None => std::ptr::null(),
-                }
-            })
-        };
-        let renderer = render::Renderer::new(&gl, &self.font_data)?;
-        self.egl.window = Some(window);
-        self.egl.surface = Some(egl_surface);
-        self.gl = Some(gl);
-        self.renderer = Some(renderer);
+        // First show after daemon start: build the GL context + renderer.
+        // Subsequent shows reuse them — the EGL context survives surface
+        // destruction so all GPU resources (atlases, vertex buffers) stay.
+        if self.gl.is_none() {
+            let instance_ptr: *const Egl = &self.egl_static.instance;
+            let gl = unsafe {
+                glow::Context::from_loader_function(|s| {
+                    let inst = &*instance_ptr;
+                    match inst.get_proc_address(s) {
+                        Some(f) => f as *const _,
+                        None => std::ptr::null(),
+                    }
+                })
+            };
+            let renderer = render::Renderer::new(&gl, &self.font_data)?;
+            self.gl = Some(gl);
+            self.renderer = Some(renderer);
+        }
+        sess.egl_window = Some(window);
+        sess.egl_surface = Some(egl_surface);
         Ok(())
     }
 
     fn draw(&mut self) {
-        if !self.configured {
-            return;
+        // Bail if no session, or session not yet configured by compositor.
+        match self.session.as_ref() {
+            Some(s) if s.configured => {}
+            _ => return,
         }
         if let Err(e) = self.ensure_egl_window() {
             log::error!("egl window: {e}");
             return;
         }
-        let Some(surface) = self.egl.surface else {
-            return;
+        let (surface, width, height) = {
+            let sess = self.session.as_ref().expect("session present");
+            let Some(surface) = sess.egl_surface else { return };
+            (surface, sess.width, sess.height)
         };
-        if let Err(e) = self.egl.instance.make_current(
-            self.egl.display,
+        if let Err(e) = self.egl_static.instance.make_current(
+            self.egl_static.display,
             Some(surface),
             Some(surface),
-            Some(self.egl.context),
+            Some(self.egl_static.context),
         ) {
             log::error!("make_current: {e}");
             return;
@@ -987,7 +1066,7 @@ impl App {
 
         // Only ensure icons for the rows we'll actually render — saves first-
         // frame decode time when the result set is large.
-        let rows = visible_rows_for(self.height);
+        let rows = visible_rows_for(height);
         let end = (self.scroll_offset + rows).min(self.matches.len());
         for hit in &self.matches[self.scroll_offset..end] {
             let Some(entry) = active.get(hit.idx) else {
@@ -1004,8 +1083,8 @@ impl App {
         render_ui(
             renderer,
             gl,
-            self.width,
-            self.height,
+            width,
+            height,
             self.mode,
             active,
             &self.matches,
@@ -1015,7 +1094,11 @@ impl App {
             default_key,
         );
 
-        if let Err(e) = self.egl.instance.swap_buffers(self.egl.display, surface) {
+        if let Err(e) = self
+            .egl_static
+            .instance
+            .swap_buffers(self.egl_static.display, surface)
+        {
             log::error!("swap_buffers: {e}");
         }
     }
@@ -1261,7 +1344,7 @@ impl CompositorHandler for App {
         _: &wl_surface::WlSurface,
         _: u32,
     ) {
-        if self.visible {
+        if self.session.is_some() {
             self.draw();
         }
     }
@@ -1293,22 +1376,22 @@ impl OutputHandler for App {
         _: &QueueHandle<Self>,
         output: wl_output::WlOutput,
     ) {
-        if self.size_locked {
+        let info = match self.output.info(&output) {
+            Some(i) => i,
+            None => return,
+        };
+        let Some((lw, lh)) = info.logical_size else { return };
+        let Some(sess) = self.session.as_mut() else { return };
+        if sess.size_locked {
             return;
         }
-        let Some(info) = self.output.info(&output) else {
-            return;
-        };
-        let Some((lw, lh)) = info.logical_size else {
-            return;
-        };
         // ~62.5% of output (5/8) — bigger than half so the launcher fills
         // more of the screen for readability without becoming fullscreen.
         let target_w = (((lw * 5) / 8).max(720)) as u32;
         let target_h = (((lh * 5) / 8).max(520)) as u32;
-        self.layer.set_size(target_w, target_h);
-        self.layer.commit();
-        self.size_locked = true;
+        sess.layer.set_size(target_w, target_h);
+        sess.layer.commit();
+        sess.size_locked = true;
         log::info!("layer size set to {target_w}x{target_h} (output {lw}x{lh})");
     }
     fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
@@ -1318,33 +1401,31 @@ impl OutputHandler for App {
 
 impl LayerShellHandler for App {
     fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &LayerSurface) {
-        self.exit = true;
+        // Compositor unmapped our layer surface (e.g. output disconnect). Tear
+        // down the session but keep the daemon alive so the next show works.
+        self.destroy_session();
     }
     fn configure(
         &mut self,
         _: &Connection,
         _: &QueueHandle<Self>,
-        layer: &LayerSurface,
+        _layer: &LayerSurface,
         configure: LayerSurfaceConfigure,
         _serial: u32,
     ) {
+        let Some(sess) = self.session.as_mut() else { return };
         let (w, h) = configure.new_size;
         if w > 0 {
-            self.width = w;
+            sess.width = w;
         }
         if h > 0 {
-            self.height = h;
+            sess.height = h;
         }
-        if let Some(window) = self.egl.window.as_ref() {
-            window.resize(self.width as i32, self.height as i32, 0, 0);
+        if let Some(window) = sess.egl_window.as_ref() {
+            window.resize(sess.width as i32, sess.height as i32, 0, 0);
         }
-        self.configured = true;
-        if self.visible {
-            self.draw();
-        } else {
-            layer.wl_surface().attach(None, 0, 0);
-            layer.commit();
-        }
+        sess.configured = true;
+        self.draw();
     }
 }
 
