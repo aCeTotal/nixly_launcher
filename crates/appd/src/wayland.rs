@@ -1049,6 +1049,7 @@ impl App {
         self.query.clear();
         self.selected = 0;
         self.scroll_offset = 0;
+        self.mode = Mode::Launcher;
         self.refresh_matches();
         self.destroy_session();
     }
