@@ -9,6 +9,9 @@ use crate::mounts;
 use crate::recents::Recent;
 
 const MAX_DEPTH: usize = 12;
+// Cap the file index. Beyond this, fuzzy match is unusable and RAM cost
+// dominates the daemon's RSS. 5k recent files covers any realistic search.
+const MAX_FILES: usize = 5_000;
 
 // Hidden dirs are no longer blanket-skipped — that hides files like
 // `~/.config/foo.toml` or `~/.dotfiles/...` that the user may want to find.
@@ -80,6 +83,8 @@ pub fn spawn(tx: Sender<Vec<Recent>>) {
                 );
                 accumulated.extend(chunk);
                 accumulated.sort_by(|a, b| b.mtime.cmp(&a.mtime));
+                accumulated.truncate(MAX_FILES);
+                accumulated.shrink_to_fit();
                 if tx.send(accumulated.clone()).is_err() {
                     return;
                 }
@@ -89,8 +94,14 @@ pub fn spawn(tx: Sender<Vec<Recent>>) {
         .ok();
 }
 
+// Bounded-heap walk: keep at most MAX_FILES entries by descending mtime.
+// Drops the cold tail in O(log N) per insert, so peak RSS stays flat
+// regardless of how many files the root contains.
 fn walk_one(root: &PathBuf) -> Vec<Recent> {
-    let mut found: Vec<Recent> = Vec::new();
+    use std::collections::BinaryHeap;
+    use std::cmp::Reverse;
+
+    let mut heap: BinaryHeap<Reverse<(u64, PathBuf)>> = BinaryHeap::with_capacity(MAX_FILES + 1);
     for entry in WalkDir::new(root)
         .max_depth(MAX_DEPTH)
         .follow_links(false)
@@ -108,12 +119,18 @@ fn walk_one(root: &PathBuf) -> Vec<Recent> {
             .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        found.push(Recent {
-            path: entry.into_path(),
-            mtime,
-        });
+        if heap.len() < MAX_FILES {
+            heap.push(Reverse((mtime, entry.into_path())));
+        } else if let Some(Reverse((min_mtime, _))) = heap.peek() {
+            if mtime > *min_mtime {
+                heap.pop();
+                heap.push(Reverse((mtime, entry.into_path())));
+            }
+        }
     }
-    found
+    heap.into_iter()
+        .map(|Reverse((mtime, path))| Recent { path, mtime })
+        .collect()
 }
 
 fn is_skipped(entry: &DirEntry) -> bool {
