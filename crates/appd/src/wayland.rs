@@ -607,6 +607,9 @@ fn build_files_list() -> Vec<ListEntry> {
 fn files_list_from_recents(recents: Vec<recents::Recent>) -> Vec<ListEntry> {
     recents
         .into_iter()
+        // The index walker already skips hidden paths; this also catches xbel
+        // recents pointing outside home or into dot-dirs.
+        .filter(|r| is_visible_home_file(&r.path))
         .map(|r| ListEntry {
             label: file_label(&r.path),
             icon_hint: Some(icon::DEFAULT_FILE.to_string()),
@@ -614,6 +617,18 @@ fn files_list_from_recents(recents: Vec<recents::Recent>) -> Vec<ListEntry> {
             action: Action::Open(r.path),
         })
         .collect()
+}
+
+// True for files under $HOME whose relative path has no hidden (dot-prefixed)
+// component — filters the no-query "recent documents" view down to things the
+// user actually edited, not app state churning under ~/.config etc.
+fn is_visible_home_file(path: &Path) -> bool {
+    let Some(home) = std::env::var_os("HOME") else { return false };
+    let Ok(rel) = path.strip_prefix(&home) else { return false };
+    !rel.components().any(|c| match c {
+        std::path::Component::Normal(s) => s.to_string_lossy().starts_with('.'),
+        _ => false,
+    })
 }
 
 fn file_label(p: &Path) -> String {
@@ -703,7 +718,8 @@ impl App {
         self.matches = self.matcher.search(list, |e| e.label.as_str(), &self.query);
         // File search: with no query, limit to the 20 most recently edited.
         // With a query, all fuzzy matches are kept so Enter (→ dolphin staging)
-        // collects every result.
+        // collects every result. The list itself is visible-home-only — both
+        // the index walker and the xbel seed filter hidden/outside-home paths.
         if self.mode == Mode::Files && self.query.is_empty() {
             self.matches.truncate(FILES_DEFAULT_LIMIT);
         }
@@ -978,7 +994,17 @@ impl App {
     fn dispatch(&mut self, cmd: Command) {
         log::info!("recv {cmd:?}");
         match cmd {
-            Command::Toggle => self.show(),
+            Command::Toggle => {
+                if self.session.is_some() {
+                    // Modkey+p is a compositor bind, so the keypress never
+                    // reaches our keyboard handler — the toggle command is how
+                    // it lands while the launcher is open. Step pages instead.
+                    self.cycle_mode(true);
+                    self.draw();
+                } else {
+                    self.show();
+                }
+            }
             Command::Show => self.show(),
             Command::Hide => self.hide(),
             Command::Quit => self.exit = true,

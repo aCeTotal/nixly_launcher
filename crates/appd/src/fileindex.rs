@@ -13,54 +13,18 @@ const MAX_DEPTH: usize = 12;
 // dominates the daemon's RSS. 5k recent files covers any realistic search.
 const MAX_FILES: usize = 5_000;
 
-// Hidden dirs are no longer blanket-skipped — that hides files like
-// `~/.config/foo.toml` or `~/.dotfiles/...` that the user may want to find.
-// Instead we maintain an explicit deny-list of known-heavy noise dirs.
+// Everything hidden (dot-prefixed dirs and files) is skipped — the index
+// covers only the user's visible home files. On top of that, a deny-list of
+// known-heavy visible noise dirs.
 const SKIP_NAMES: &[&str] = &[
-    // Build / dependency caches (visible names)
+    // Build / dependency caches
     "node_modules",
     "target",
     "build",
     "dist",
     "Trash",
-    // Git internals (we still index files in repos, just not inside .git)
-    ".git",
-    // Tool/lang caches
-    ".cache",
-    ".cargo",
-    ".rustup",
-    ".npm",
-    ".gradle",
-    ".m2",
-    ".gem",
-    ".pnpm-store",
-    ".yarn",
-    ".bundle",
-    ".cabal",
-    ".stack",
-    ".gradle",
-    ".cargo-target",
-    ".tox",
-    ".pytest_cache",
-    ".mypy_cache",
-    ".ruff_cache",
-    ".venv",
     "venv",
     "__pycache__",
-    // Heavy app data dirs (XDG-style)
-    ".local",
-    ".mozilla",
-    ".thunderbird",
-    ".steam",
-    ".vscode",
-    ".vscode-server",
-    ".cursor-server",
-    ".thumbnails",
-    // Browser profiles / data
-    ".config/google-chrome",
-    ".config/chromium",
-    ".config/BraveSoftware",
-    ".config/discord",
 ];
 
 pub fn spawn(tx: Sender<Vec<Recent>>) {
@@ -134,20 +98,16 @@ fn walk_one(root: &PathBuf) -> Vec<Recent> {
 }
 
 fn is_skipped(entry: &DirEntry) -> bool {
-    if !entry.file_type().is_dir() {
+    if entry.depth() == 0 {
         return false;
     }
     let name = entry.file_name();
     let Some(s) = name.to_str() else {
         return false;
     };
-    if entry.depth() == 0 {
-        return false;
-    }
-    // Per-uid trash dirs (`.Trash-1000`, `.Trash-1001` …) — the FreeDesktop
-    // trash spec puts them on every mount. Skip the prefix unconditionally.
-    if s.starts_with(".Trash-") {
+    // Hidden dirs and files alike — the index is visible-home-only.
+    if s.starts_with('.') {
         return true;
     }
-    SKIP_NAMES.iter().any(|b| s == *b)
+    entry.file_type().is_dir() && SKIP_NAMES.iter().any(|b| s == *b)
 }
