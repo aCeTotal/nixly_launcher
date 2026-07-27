@@ -209,7 +209,13 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("WaylandSource: {e}"))?;
 
     let (cmd_tx, cmd_rx) = calloop::channel::channel::<Command>();
-    crate::socket::spawn(cmd_tx)?;
+    if let Err(e) = crate::socket::spawn(cmd_tx) {
+        if crate::socket::already_running(&e) {
+            log::info!("{e} — exiting, the running instance owns modkey+p");
+            return Ok(());
+        }
+        return Err(e.into());
+    }
     loop_handle
         .insert_source(cmd_rx, |ev, _, app: &mut App| {
             if let calloop::channel::Event::Msg(cmd) = ev {
@@ -420,7 +426,13 @@ struct UiSession {
     height: u32,
     configured: bool,
     size_locked: bool,
+    /* Når surfacet ble laget. Kommer ingen configure innen
+     * SESSION_CONFIGURE_GRACE er sesjonen tapt og neste show() bygger den
+     * på nytt istf å tro at launcheren er oppe. */
+    created: std::time::Instant,
 }
+
+const SESSION_CONFIGURE_GRACE: std::time::Duration = std::time::Duration::from_millis(700);
 
 struct EglStatic {
     instance: Egl,
@@ -995,7 +1007,10 @@ impl App {
         log::info!("recv {cmd:?}");
         match cmd {
             Command::Toggle => {
-                if self.session.is_some() {
+                // Only a CONFIGURED session is one the user can see. Anything
+                // else goes to show(), which rebuilds a lost surface — else
+                // modkey+p would page through an invisible launcher.
+                if self.session.as_ref().is_some_and(|s| s.configured) {
                     // Modkey+p is a compositor bind, so the keypress never
                     // reaches our keyboard handler — the toggle command is how
                     // it lands while the launcher is open. Step pages instead.
@@ -1017,10 +1032,21 @@ impl App {
     // an awkward state). The EGL display / context survive across cycles so
     // the GL renderer + atlases are reused.
     fn show(&mut self) {
-        if self.session.is_some() {
-            // Already showing — just redraw so the newest match list lands.
-            self.draw();
-            return;
+        if let Some(sess) = self.session.as_ref() {
+            if sess.configured {
+                // Already showing — just redraw so the newest match list lands.
+                self.draw();
+                return;
+            }
+            // A session that never got configured is a session the user
+            // cannot see: the compositor dropped the layer surface, or the
+            // configure was lost. Every later show() would early-return on
+            // it and modkey+p would look dead until appd restarts. Rebuild.
+            if sess.created.elapsed() < SESSION_CONFIGURE_GRACE {
+                return;
+            }
+            log::warn!("session never configured — rebuilding layer surface");
+            self.destroy_session();
         }
 
         let surface = self.compositor.create_surface(&self.qh);
@@ -1061,6 +1087,7 @@ impl App {
             height,
             configured: false,
             size_locked,
+            created: std::time::Instant::now(),
         });
         log::info!("show: layer surface created {width}x{height}");
     }

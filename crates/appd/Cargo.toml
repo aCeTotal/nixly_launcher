@@ -13,6 +13,7 @@ path = "src/main.rs"
 protocol.workspace = true
 log.workspace = true
 env_logger.workspace = true
+libc                    = "0.2"
 
 smithay-client-toolkit  = "0.19"
 wayland-client          = "0.31"

@@ -35,9 +35,20 @@ impl Command {
     }
 }
 
-pub fn socket_path() -> PathBuf {
-    let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+fn runtime_dir() -> PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-    runtime.join("nixly_launcher.sock")
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+}
+
+pub fn socket_path() -> PathBuf {
+    runtime_dir().join("nixly_launcher.sock")
+}
+
+/* Eierskapslås for single-instance. Egen fil, ikke selve socketen: flock
+ * må tas FØR socketen røres, ellers er vi tilbake til racet den skal
+ * fjerne. Kjernen slipper låsen når prosessen dør, så en krasjet appd
+ * sperrer ikke neste oppstart. */
+pub fn lock_path() -> PathBuf {
+    runtime_dir().join("nixly_launcher.lock")
 }
