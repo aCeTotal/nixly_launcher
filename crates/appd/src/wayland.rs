@@ -64,6 +64,22 @@ const DEFAULT_REPEAT_RATE: Duration = Duration::from_millis(33);
 const FALLBACK_WIDTH: u32 = 1200;
 const FALLBACK_HEIGHT: u32 = 720;
 
+// Preferred size is ~62.5% of the output (5/8) — bigger than half so the
+// launcher fills enough of the screen to be readable without going fullscreen.
+// The minimums keep it usable on a large screen; the margin caps it so the
+// window always fits entirely on a small one, minimums included.
+const MIN_WIDTH: i32 = 720;
+const MIN_HEIGHT: i32 = 520;
+const SCREEN_MARGIN: i32 = 24;
+
+fn size_for_output(logical_w: i32, logical_h: i32) -> (u32, u32) {
+    let fit_w = (logical_w - 2 * SCREEN_MARGIN).max(1);
+    let fit_h = (logical_h - 2 * SCREEN_MARGIN).max(1);
+    let w = ((logical_w * 5) / 8).max(MIN_WIDTH).min(fit_w);
+    let h = ((logical_h * 5) / 8).max(MIN_HEIGHT).min(fit_h);
+    (w as u32, h as u32)
+}
+
 type Egl = egl::DynamicInstance<egl::EGL1_5>;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -426,6 +442,9 @@ struct UiSession {
     height: u32,
     configured: bool,
     size_locked: bool,
+    // The output the surface is currently on, as reported by surface_enter.
+    // Sizing follows this output, not whichever output happened to be first.
+    output: Option<wl_output::WlOutput>,
     /* Når surfacet ble laget. Kommer ingen configure innen
      * SESSION_CONFIGURE_GRACE er sesjonen tapt og neste show() bygger den
      * på nytt istf å tro at launcheren er oppe. */
@@ -1058,20 +1077,22 @@ impl App {
             None,
         );
 
-        // Pick size from the first available output before commit so the
-        // launcher is sized correctly on its very first frame, before
-        // configure arrives. Outputs the OutputState already saw at startup
-        // are visible here; any new output that appears later is handled in
-        // OutputHandler::new_output via size_locked.
+        // Provisional size from the smallest known output so the very first
+        // frame — drawn before we know which output the compositor puts us on
+        // — can never be larger than the screen it lands on. The real size
+        // comes from CompositorHandler::surface_enter, which tells us the
+        // actual output.
         let (mut width, mut height, mut size_locked) =
             (FALLBACK_WIDTH, FALLBACK_HEIGHT, false);
         for output in self.output.outputs() {
             let Some(info) = self.output.info(&output) else { continue };
             let Some((lw, lh)) = info.logical_size else { continue };
-            width = (((lw * 5) / 8).max(720)) as u32;
-            height = (((lh * 5) / 8).max(520)) as u32;
+            let (w, h) = size_for_output(lw, lh);
+            if !size_locked || w * h < width * height {
+                width = w;
+                height = h;
+            }
             size_locked = true;
-            break;
         }
 
         layer.set_anchor(Anchor::empty()); // empty == centered
@@ -1087,9 +1108,27 @@ impl App {
             height,
             configured: false,
             size_locked,
+            output: None,
             created: std::time::Instant::now(),
         });
         log::info!("show: layer surface created {width}x{height}");
+    }
+
+    // Resize the live layer surface to fit `output`. Called whenever we learn
+    // which output the launcher is on (surface_enter) or that output's mode
+    // changed, so the window always fits the screen it is actually shown on.
+    fn resize_to_output(&mut self, output: &wl_output::WlOutput) {
+        let Some(info) = self.output.info(output) else { return };
+        let Some((lw, lh)) = info.logical_size else { return };
+        let (w, h) = size_for_output(lw, lh);
+        let Some(sess) = self.session.as_mut() else { return };
+        if sess.size_locked && sess.width == w && sess.height == h {
+            return;
+        }
+        sess.layer.set_size(w, h);
+        sess.layer.commit();
+        sess.size_locked = true;
+        log::info!("layer size set to {w}x{h} (output {lw}x{lh})");
     }
 
     fn hide(&mut self) {
@@ -1497,9 +1536,18 @@ impl CompositorHandler for App {
         &mut self,
         _: &Connection,
         _: &QueueHandle<Self>,
-        _: &wl_surface::WlSurface,
-        _: &wl_output::WlOutput,
+        surface: &wl_surface::WlSurface,
+        output: &wl_output::WlOutput,
     ) {
+        // First point at which the compositor tells us which screen the
+        // launcher landed on. Size to that screen — the size chosen in show()
+        // was only a guess.
+        let Some(sess) = self.session.as_mut() else { return };
+        if sess.layer.wl_surface() != surface {
+            return;
+        }
+        sess.output = Some(output.clone());
+        self.resize_to_output(output);
     }
     fn surface_leave(
         &mut self,
@@ -1521,26 +1569,31 @@ impl OutputHandler for App {
         _: &QueueHandle<Self>,
         output: wl_output::WlOutput,
     ) {
-        let info = match self.output.info(&output) {
-            Some(i) => i,
-            None => return,
-        };
-        let Some((lw, lh)) = info.logical_size else { return };
-        let Some(sess) = self.session.as_mut() else { return };
-        if sess.size_locked {
-            return;
+        // Only a fallback: an output appearing while we're up but before any
+        // surface_enter told us where we are. Once surface_enter has run, that
+        // output owns the size.
+        match self.session.as_ref() {
+            Some(s) if s.output.is_none() && !s.size_locked => {}
+            _ => return,
         }
-        // ~62.5% of output (5/8) — bigger than half so the launcher fills
-        // more of the screen for readability without becoming fullscreen.
-        let target_w = (((lw * 5) / 8).max(720)) as u32;
-        let target_h = (((lh * 5) / 8).max(520)) as u32;
-        sess.layer.set_size(target_w, target_h);
-        sess.layer.commit();
-        sess.size_locked = true;
-        log::info!("layer size set to {target_w}x{target_h} (output {lw}x{lh})");
+        self.resize_to_output(&output);
     }
-    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
-    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {
+    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, output: wl_output::WlOutput) {
+        // Resolution / scale change on the output we're displayed on.
+        let on_this_output = self
+            .session
+            .as_ref()
+            .is_some_and(|s| s.output.as_ref() == Some(&output));
+        if on_this_output {
+            self.resize_to_output(&output);
+        }
+    }
+    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, output: wl_output::WlOutput) {
+        if let Some(sess) = self.session.as_mut() {
+            if sess.output.as_ref() == Some(&output) {
+                sess.output = None;
+            }
+        }
     }
 }
 
