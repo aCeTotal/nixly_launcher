@@ -32,7 +32,7 @@ use wayland_client::{
 use wayland_egl::WlEglSurface;
 
 use calloop::timer::{TimeoutAction, Timer};
-use calloop::EventLoop;
+use calloop::{EventLoop, LoopHandle, RegistrationToken};
 use calloop_wayland_source::WaylandSource;
 
 use crate::desktop;
@@ -53,9 +53,11 @@ const FILES_SEED_LIMIT: usize = 30;    // initial xbel+local seed before fileind
 const CURRENT_SYSTEM_POLL: Duration = Duration::from_secs(5);
 // Periodic re-walk for files + git so the daemon picks up new files and new
 // git checkouts without a manual restart. inotify on local home would be
-// faster but NFS doesn't support inotify, so we poll at a moderate rate that
-// covers both. Daemon is idle between ticks.
-const REINDEX_INTERVAL: Duration = Duration::from_secs(300);
+// faster but NFS doesn't support inotify, so we poll to cover both.
+// 30 min, ikke 5: hver tick er en FULL $HOME+NFS-walk + gitscan — ved 5 min
+// sto daemonen for jevn bakgrunns-IO/CPU hele sesjonen. Launcher-lista er
+// aldri tidskritisk, og app-dirs dekkes live av inotify-watcheren.
+const REINDEX_INTERVAL: Duration = Duration::from_secs(1800);
 
 const REPEAT_TICK: Duration = Duration::from_millis(16);
 const DEFAULT_REPEAT_DELAY: Duration = Duration::from_millis(400);
@@ -260,15 +262,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         )
         .map_err(|e| format!("insert timer source: {e}"))?;
 
-    loop_handle
-        .insert_source(
-            Timer::from_duration(REPEAT_TICK),
-            |_deadline, _, app: &mut App| {
-                app.tick_repeat();
-                TimeoutAction::ToDuration(REPEAT_TICK)
-            },
-        )
-        .map_err(|e| format!("insert repeat timer: {e}"))?;
+    // Ingen permanent repeat-timer her: 16 ms-ticken lå og fyrte 62 ganger
+    // i sekundet HELE sesjonen (launcher skjult, ingen tast nede) — målt som
+    // ~60 wakeups/s på appd. Timeren armes i arm_repeat() når en repeterbar
+    // tast trykkes, og dropper seg selv når repeat-tilstanden er borte.
 
     let entries = desktop::index().unwrap_or_default();
     log::info!("indexed {} .desktop entries", entries.len());
@@ -351,6 +348,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         keyboard: None,
         modifiers: Modifiers::default(),
         repeat: None,
+        repeat_timer: None,
+        loop_handle: loop_handle.clone(),
         repeat_delay: DEFAULT_REPEAT_DELAY,
         repeat_rate: DEFAULT_REPEAT_RATE,
         compositor: compositor_state,
@@ -401,6 +400,10 @@ pub struct App {
     keyboard: Option<wl_keyboard::WlKeyboard>,
     modifiers: Modifiers,
     repeat: Option<RepeatState>,
+    // On-demand 16 ms repeat-timer: armes ved repeterbar key-down, dropper
+    // seg selv når repeat er slippt. None = ingen timer registrert.
+    repeat_timer: Option<RegistrationToken>,
+    loop_handle: LoopHandle<'static, App>,
     repeat_delay: Duration,
     repeat_rate: Duration,
     compositor: CompositorState,
@@ -842,6 +845,28 @@ impl App {
             event,
             next_fire: Instant::now() + self.repeat_delay,
         });
+        // Start 16 ms-ticken kun nå som en tast faktisk repeteres. Timeren
+        // dropper seg selv (og nullstiller tokenet) så snart repeat er borte.
+        if self.repeat_timer.is_none() {
+            match self.loop_handle.insert_source(
+                Timer::from_duration(REPEAT_TICK),
+                |_deadline, _, app: &mut App| {
+                    if app.repeat.is_none() {
+                        app.repeat_timer = None;
+                        return TimeoutAction::Drop;
+                    }
+                    app.tick_repeat();
+                    if app.repeat.is_none() {
+                        app.repeat_timer = None;
+                        return TimeoutAction::Drop;
+                    }
+                    TimeoutAction::ToDuration(REPEAT_TICK)
+                },
+            ) {
+                Ok(token) => self.repeat_timer = Some(token),
+                Err(e) => log::error!("arm repeat timer: {e}"),
+            }
+        }
     }
 
     fn disarm_repeat(&mut self, keysym: Keysym) {
