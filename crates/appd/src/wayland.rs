@@ -1571,6 +1571,12 @@ impl CompositorHandler for App {
         if sess.layer.wl_surface() != surface {
             return;
         }
+        // First enter wins: a centered layer surface lives on one screen, so
+        // a second enter is a phantom output (a parked remote screen) whose
+        // size would resize the launcher out from under the user.
+        if sess.output.is_some() {
+            return;
+        }
         sess.output = Some(output.clone());
         self.resize_to_output(output);
     }

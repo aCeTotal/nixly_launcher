@@ -10,16 +10,21 @@ pub struct Entry {
 }
 
 pub fn search_paths() -> Vec<PathBuf> {
-    let mut paths = vec![
+    // XDG_DATA_HOME first, as the spec requires: dedup is first-wins, so a
+    // user override (nixly-gfn replacing the GeForce NOW flatpak entry) must
+    // outrank the system copy it shadows.
+    let mut paths = Vec::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        paths.push(PathBuf::from(home).join(".local/share/applications"));
+    }
+    paths.extend([
         PathBuf::from("/run/current-system/sw/share/applications"),
         PathBuf::from("/var/lib/flatpak/exports/share/applications"),
         PathBuf::from("/usr/share/applications"),
         PathBuf::from("/usr/local/share/applications"),
-    ];
+    ]);
     if let Some(home) = std::env::var_os("HOME") {
-        let home = PathBuf::from(home);
-        paths.push(home.join(".nix-profile/share/applications"));
-        paths.push(home.join(".local/share/applications"));
+        paths.push(PathBuf::from(home).join(".nix-profile/share/applications"));
     }
     if let Ok(user) = std::env::var("USER") {
         paths.push(PathBuf::from(format!(

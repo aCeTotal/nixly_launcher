@@ -60,6 +60,15 @@ fn run(paths: Vec<PathBuf>, tx: Sender<WatchEvent>) {
             Ok(ev) => ev,
             Err(_) => return,
         };
+        // Reindex reads every .desktop file in the watched dirs, which
+        // emits OPEN/ACCESS/CLOSE_NOWRITE events right back at us — one
+        // reindex fed the next forever (a rescan every 5 s all session).
+        // Only mutations can change the index; ignore pure reads.
+        if let Ok(ev) = &first {
+            if ev.kind.is_access() {
+                continue;
+            }
+        }
         // Drain until a `DEBOUNCE` window passes with no new events.
         loop {
             match raw_rx.recv_timeout(DEBOUNCE) {
