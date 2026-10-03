@@ -9,22 +9,13 @@ pub struct Entry {
     pub path: PathBuf,
 }
 
+// XDG precedence: user dir first.
 pub fn search_paths() -> Vec<PathBuf> {
-    // XDG_DATA_HOME first, as the spec requires: dedup is first-wins, so a
-    // user override (nixly-gfn replacing the GeForce NOW flatpak entry) must
-    // outrank the system copy it shadows.
     let mut paths = Vec::new();
     if let Some(home) = std::env::var_os("HOME") {
-        paths.push(PathBuf::from(home).join(".local/share/applications"));
-    }
-    paths.extend([
-        PathBuf::from("/run/current-system/sw/share/applications"),
-        PathBuf::from("/var/lib/flatpak/exports/share/applications"),
-        PathBuf::from("/usr/share/applications"),
-        PathBuf::from("/usr/local/share/applications"),
-    ]);
-    if let Some(home) = std::env::var_os("HOME") {
-        paths.push(PathBuf::from(home).join(".nix-profile/share/applications"));
+        let home = PathBuf::from(home);
+        paths.push(home.join(".local/share/applications"));
+        paths.push(home.join(".nix-profile/share/applications"));
     }
     if let Ok(user) = std::env::var("USER") {
         paths.push(PathBuf::from(format!(
@@ -32,19 +23,24 @@ pub fn search_paths() -> Vec<PathBuf> {
         )));
     }
     if let Ok(xdg) = std::env::var("XDG_DATA_DIRS") {
-        for d in xdg.split(':') {
-            paths.push(PathBuf::from(d).join("applications"));
-        }
+        paths.extend(xdg.split(':').map(|d| PathBuf::from(d).join("applications")));
     }
+    paths.extend(
+        [
+            "/run/current-system/sw/share/applications",
+            "/var/lib/flatpak/exports/share/applications",
+            "/usr/local/share/applications",
+            "/usr/share/applications",
+        ]
+        .map(PathBuf::from),
+    );
     paths
 }
 
 pub fn index() -> std::io::Result<Vec<Entry>> {
     let mut out = Vec::new();
-    // Primary dedup: same .desktop file surfaced via multiple XDG dirs (NixOS
-    // typically has the same file in /etc/profiles, /run/current-system, and
-    // ~/.nix-profile, all symlinked to the same store path).
-    let mut seen_canonical: std::collections::HashSet<PathBuf> =
+    // First desktop ID wins.
+    let mut seen_id: std::collections::HashSet<std::ffi::OsString> =
         std::collections::HashSet::new();
     for dir in search_paths() {
         let Ok(rd) = std::fs::read_dir(&dir) else {
@@ -55,8 +51,7 @@ pub fn index() -> std::io::Result<Vec<Entry>> {
             if p.extension().and_then(|s| s.to_str()) != Some("desktop") {
                 continue;
             }
-            let canonical = std::fs::canonicalize(&p).unwrap_or_else(|_| p.clone());
-            if !seen_canonical.insert(canonical) {
+            if !seen_id.insert(ent.file_name()) {
                 continue;
             }
             if let Some(e) = parse(&p) {
@@ -64,9 +59,7 @@ pub fn index() -> std::io::Result<Vec<Entry>> {
             }
         }
     }
-    // Secondary dedup: distinct .desktop files that describe the same launchable
-    // (e.g. `brave-browser.desktop` + `com.brave.Browser.desktop`). Keep the
-    // first occurrence.
+    // Same app, different IDs.
     let mut seen_pair: std::collections::HashSet<(String, String)> =
         std::collections::HashSet::new();
     out.retain(|e| {
