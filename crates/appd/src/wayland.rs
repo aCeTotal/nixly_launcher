@@ -41,6 +41,8 @@ use crate::font;
 use crate::gitscan;
 use crate::icon;
 use crate::matcher;
+use crate::palette::{self, Palette};
+use crate::palettewatch;
 use crate::recents;
 use crate::render;
 use crate::state;
@@ -336,6 +338,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         )
         .map_err(|e| format!("insert reindex timer: {e}"))?;
 
+    if let Err(e) = palettewatch::insert(&loop_handle, App::reload_palette) {
+        log::warn!("palette watch: {e}");
+    }
+
     let font_data = font::load_default()
         .map_err(|e| format!("font: {e}"))?;
 
@@ -363,6 +369,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         gl: None,
         renderer: None,
         font_data,
+        palette: palette::current().unwrap_or(Palette::FALLBACK),
         exit: false,
         session: None,
         entries,
@@ -415,6 +422,7 @@ pub struct App {
     gl: Option<glow::Context>,
     renderer: Option<render::Renderer>,
     font_data: Vec<u8>,
+    palette: Palette,
     exit: bool,
     // Some(...) iff the launcher window is currently mapped. Show creates it,
     // hide tears it down — the daemon itself stays running.
@@ -723,6 +731,21 @@ impl App {
                 self.refresh_matches();
             }
             Err(e) => log::error!("reindex ({source}): {e}"),
+        }
+    }
+
+    fn reload_palette(&mut self) {
+        let Some(palette) = palette::current() else {
+            log::warn!("palette incomplete — keeping current colours");
+            return;
+        };
+        if palette == self.palette {
+            return;
+        }
+        log::info!("palette reloaded");
+        self.palette = palette;
+        if self.session.is_some() {
+            self.draw();
         }
     }
 
@@ -1300,7 +1323,7 @@ impl App {
             self.selected,
             self.scroll_offset,
             &self.query,
-            default_key,
+            &self.palette,
         );
 
         if let Err(e) = self
@@ -1378,15 +1401,12 @@ fn pick_icon(
     renderer: &render::Renderer,
     name: Option<&str>,
     default_name: &str,
-) -> Option<render::IconHandle> {
-    if let Some(n) = name {
-        if let Some(h) = renderer.get_icon(n) {
-            return Some(h);
-        }
-    }
-    renderer
-        .get_icon(default_name)
-        .or_else(|| renderer.get_icon(PROCEDURAL_DEFAULT))
+    glyph: render::Color,
+) -> Option<(render::IconHandle, render::Color)> {
+    name.and_then(|n| renderer.get_icon(n))
+        .or_else(|| renderer.get_icon(default_name))
+        .map(|h| (h, render::UNTINTED))
+        .or_else(|| renderer.get_icon(PROCEDURAL_DEFAULT).map(|h| (h, glyph)))
 }
 
 const TAB_BAR_H: f32 = 56.0;
@@ -1413,14 +1433,15 @@ fn render_ui(
     selected: usize,
     scroll_offset: usize,
     query: &str,
-    default_icon_name: &str,
+    palette: &Palette,
 ) {
+    let default_icon_name = default_icon_key(mode);
     let w = width as f32;
     let h = height as f32;
     renderer.begin(gl, width, height);
 
     // Outer panel
-    renderer.fill_rect(0.0, 0.0, w, h, render::BG);
+    renderer.fill_rect(0.0, 0.0, w, h, palette.panel);
 
     // ── Tab bar ─────────────────────────────────────────────────────────────
     let tab_w = w / Mode::ALL.len() as f32;
@@ -1428,23 +1449,23 @@ fn render_ui(
         let x = i as f32 * tab_w;
         let active = *m == mode;
         if active {
-            renderer.fill_rect(x, 0.0, tab_w, TAB_BAR_H, render::SEL_BG);
-            renderer.fill_rect(x, TAB_BAR_H - 2.0, tab_w, 2.0, render::ACCENT);
+            renderer.fill_rect(x, 0.0, tab_w, TAB_BAR_H, palette.selection);
+            renderer.fill_rect(x, TAB_BAR_H - 2.0, tab_w, 2.0, palette.accent);
         }
         let label = m.label();
         let label_w = approx_text_width(label, TAB_TEXT_SIZE);
         let tx = x + (tab_w - label_w) * 0.5;
         let baseline = TAB_BAR_H * 0.5 + TAB_TEXT_SIZE * 0.36;
-        let color = if active { render::FG } else { render::FG_DIM };
+        let color = if active { palette.on_selection } else { palette.text_dim };
         renderer.draw_text(gl, tx, baseline, TAB_TEXT_SIZE, label, color);
     }
 
     // ── Search bar ──────────────────────────────────────────────────────────
     let sy = TAB_BAR_H;
-    renderer.fill_rect(0.0, sy, w, SEARCH_H, render::BG);
-    renderer.fill_rect(0.0, sy + SEARCH_H - 1.0, w, 1.0, render::SEL_BG);
+    renderer.fill_rect(0.0, sy, w, SEARCH_H, palette.panel);
+    renderer.fill_rect(0.0, sy + SEARCH_H - 1.0, w, 1.0, palette.divider);
     let baseline = sy + SEARCH_H * 0.5 + TEXT_SIZE * 0.36;
-    let after_prompt = renderer.draw_text(gl, PAD, baseline, TEXT_SIZE, "›", render::ACCENT);
+    let after_prompt = renderer.draw_text(gl, PAD, baseline, TEXT_SIZE, "›", palette.accent);
     let q_x = after_prompt + 8.0;
     if query.is_empty() {
         let placeholder: String = match mode {
@@ -1452,9 +1473,9 @@ fn render_ui(
             Mode::Files => format!("Search {} files…", list.len()),
             Mode::Git => format!("Search {} git projects…", list.len()),
         };
-        renderer.draw_text(gl, q_x, baseline, TEXT_SIZE, &placeholder, render::FG_DIM);
+        renderer.draw_text(gl, q_x, baseline, TEXT_SIZE, &placeholder, palette.placeholder);
     } else {
-        renderer.draw_text(gl, q_x, baseline, TEXT_SIZE, query, render::FG);
+        renderer.draw_text(gl, q_x, baseline, TEXT_SIZE, query, palette.text);
     }
 
     // ── Result list (windowed) ──────────────────────────────────────────────
@@ -1467,19 +1488,20 @@ fn render_ui(
         let hit = matches[i];
         let row_y = list_top + (slot as f32) * ROW_H;
         if i == selected {
-            renderer.fill_rect(0.0, row_y, w, ROW_H, render::SEL_BG);
+            renderer.fill_rect(0.0, row_y, w, ROW_H, palette.selection);
         }
         let entry = &list[hit.idx];
         let row_baseline = row_y + ROW_H * 0.5 + TEXT_SIZE * 0.36;
 
         let icon_x = PAD;
         let icon_y = row_y + (ROW_H - icon_box) * 0.5;
-        if let Some(handle) = pick_icon(renderer, entry.icon_hint.as_deref(), default_icon_name) {
-            renderer.draw_icon(icon_x, icon_y, icon_box, icon_box, handle);
+        let icon = pick_icon(renderer, entry.icon_hint.as_deref(), default_icon_name, palette.glyph);
+        if let Some((handle, tint)) = icon {
+            renderer.draw_icon(icon_x, icon_y, icon_box, icon_box, handle, tint);
         }
 
         let label_x = icon_x + icon_box + 12.0;
-        let fg = if i == selected { render::FG } else { render::FG_DIM };
+        let fg = if i == selected { palette.on_selection } else { palette.text_dim };
         renderer.draw_text(gl, label_x, row_baseline, TEXT_SIZE, &entry.label, fg);
     }
 
@@ -1497,14 +1519,14 @@ fn render_ui(
             0.0
         };
         let thumb_y = list_top + scroll_frac * (track_h - thumb_h);
-        renderer.fill_rect(track_x, list_top, track_w, track_h, [0.18, 0.20, 0.26, 0.6]);
-        renderer.fill_rect(track_x, thumb_y, track_w, thumb_h, render::ACCENT);
+        renderer.fill_rect(track_x, list_top, track_w, track_h, palette.track);
+        renderer.fill_rect(track_x, thumb_y, track_w, thumb_h, palette.accent);
     }
 
     if matches.is_empty() {
         let msg = "No matches";
         let mw = approx_text_width(msg, TEXT_SIZE);
-        renderer.draw_text(gl, (w - mw) * 0.5, list_top + 36.0, TEXT_SIZE, msg, render::FG_DIM);
+        renderer.draw_text(gl, (w - mw) * 0.5, list_top + 36.0, TEXT_SIZE, msg, palette.text_dim);
     }
 
     renderer.finish(gl);

@@ -229,8 +229,9 @@ fn premultiply(rgba: &mut [u8]) {
     }
 }
 
-// Rounded slate square. Used when the resolver returns nothing, so the row
-// keeps its rhythm regardless of icon coverage.
+const GLYPH_TOP_SHADE: f32 = 0.13;
+
+// Rounded square, tinted when drawn.
 pub fn default_rgba() -> Vec<u8> {
     let size = ICON_SIZE;
     let mut out = vec![0u8; (size * size * 4) as usize];
@@ -247,14 +248,9 @@ pub fn default_rgba() -> Vec<u8> {
             let cov = (0.5 - dist).clamp(0.0, 1.0);
             let alpha = (cov * 255.0) as u8;
             let t = y as f32 / size as f32;
-            let r = (110.0 + 12.0 * t) as u32;
-            let g = (118.0 + 18.0 * t) as u32;
-            let b = (140.0 + 28.0 * t) as u32;
+            let shade = 1.0 - GLYPH_TOP_SHADE * (1.0 - t);
             let i = ((y * size + x) * 4) as usize;
-            let a = alpha as u32;
-            out[i] = ((r * a) / 255) as u8;
-            out[i + 1] = ((g * a) / 255) as u8;
-            out[i + 2] = ((b * a) / 255) as u8;
+            out[i..i + 3].fill((shade * f32::from(alpha)) as u8);
             out[i + 3] = alpha;
         }
     }

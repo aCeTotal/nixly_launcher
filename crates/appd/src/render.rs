@@ -5,11 +5,7 @@ use glow::HasContext;
 
 pub type Color = [f32; 4];
 
-pub const BG: Color = [0.06, 0.06, 0.08, 0.94];
-pub const FG: Color = [0.92, 0.92, 0.94, 1.0];
-pub const FG_DIM: Color = [0.55, 0.55, 0.58, 1.0];
-pub const ACCENT: Color = [0.27, 0.55, 0.95, 1.0];
-pub const SEL_BG: Color = [0.20, 0.22, 0.30, 1.0];
+pub const UNTINTED: Color = [1.0; 4];
 
 const ATLAS_W: u32 = 1024;
 const ATLAS_H: u32 = 1024;
@@ -226,11 +222,11 @@ impl Renderer {
         self.atlas.icons.get(key).copied()
     }
 
-    pub fn draw_icon(&mut self, x: f32, y: f32, w: f32, h: f32, handle: IconHandle) {
+    pub fn draw_icon(&mut self, x: f32, y: f32, w: f32, h: f32, handle: IconHandle, tint: Color) {
         self.push_quad(
             x, y, w, h,
             handle.uv[0], handle.uv[1], handle.uv[2], handle.uv[3],
-            [1.0, 1.0, 1.0, 1.0],
+            tint,
         );
     }
 

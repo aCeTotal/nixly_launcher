@@ -5,6 +5,8 @@ mod gitscan;
 mod icon;
 mod matcher;
 mod mounts;
+mod palette;
+mod palettewatch;
 mod recents;
 mod render;
 mod socket;
