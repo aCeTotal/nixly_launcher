@@ -82,6 +82,7 @@ pub fn spawn(tx: Sender<Vec<GitProject>>) {
     thread::Builder::new()
         .name("gitscan".into())
         .spawn(move || {
+            crate::idle::demote();
             let roots = mounts::walk_roots();
             log::info!("gitscan: roots = {:?}", roots);
             let mut accumulated: Vec<GitProject> = Vec::new();

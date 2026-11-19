@@ -3,6 +3,7 @@ mod fileindex;
 mod font;
 mod gitscan;
 mod icon;
+mod idle;
 mod matcher;
 mod mounts;
 mod palette;

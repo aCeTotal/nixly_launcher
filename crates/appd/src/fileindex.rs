@@ -31,6 +31,7 @@ pub fn spawn(tx: Sender<Vec<Recent>>) {
     thread::Builder::new()
         .name("fileindex".into())
         .spawn(move || {
+            crate::idle::demote();
             let roots = mounts::walk_roots();
             log::info!("fileindex: roots = {:?}", roots);
             // Stream per-root: home arrives within seconds, NFS shares append
